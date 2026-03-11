@@ -7,10 +7,5 @@ buildscript {
         classpath 'com.android.tools.build:gradle:8.2.0'
     }
 }
-
-allprojects {
-}
-
-task clean(type: Delete) {
-    delete rootProject.buildDir
-}
+allprojects {}
+task clean(type: Delete) { delete rootProject.buildDir }

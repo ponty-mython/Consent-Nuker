@@ -10,6 +10,7 @@ import android.content.Intent;
 import android.graphics.Path;
 import android.graphics.Rect;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
@@ -18,10 +19,8 @@ import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.Toast;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
 
 public class ConsentNukerService extends AccessibilityService {
 
@@ -37,7 +36,7 @@ public class ConsentNukerService extends AccessibilityService {
     private static final long DETECTION_COOLDOWN_MS = 5000;
     private int totalTogglesFlipped = 0;
 
-    // Detection patterns - text that indicates a consent management dialog
+    // Detection patterns for identifying consent screens
     private static final String[] CONSENT_SCREEN_INDICATORS = {
         "vendor preferences",
         "cookie duration",
@@ -54,16 +53,12 @@ public class ConsentNukerService extends AccessibilityService {
         "partner preferences",
         "manage partners",
         "tcf vendors",
-        "iab vendors"
+        "iab vendors",
+        "confirm choices",
+        "accept all"
     };
 
-    // Patterns for toggles we want to switch OFF
-    private static final String[] TOGGLE_TARGET_PATTERNS = {
-        "consent",
-        "legitimate interest"
-    };
-
-    // Patterns for the "Vendors" tab/button we need to navigate to
+    // Patterns for the "Vendors" tab/button
     private static final String[] VENDOR_TAB_PATTERNS = {
         "vendors",
         "vendor list",
@@ -129,6 +124,7 @@ public class ConsentNukerService extends AccessibilityService {
 
         if (isConsentScreen(rootNode)) {
             lastDetectionTime = now;
+            Log.d(TAG, "Consent screen detected! Showing notification.");
             showNukeNotification();
         }
 
@@ -145,7 +141,6 @@ public class ConsentNukerService extends AccessibilityService {
         for (String indicator : CONSENT_SCREEN_INDICATORS) {
             if (findNodeWithText(root, indicator) != null) {
                 matchCount++;
-                // Require at least 2 matching indicators to reduce false positives
                 if (matchCount >= 2) return true;
             }
         }
@@ -198,37 +193,41 @@ public class ConsentNukerService extends AccessibilityService {
     }
 
     /**
-     * Main entry point - called when user taps the notification.
-     * Orchestrates the full nuke sequence across both screens.
+     * Main nuke entry point.
      */
     public void executeNuke() {
         if (isNuking) return;
         isNuking = true;
         totalTogglesFlipped = 0;
 
-        Log.d(TAG, "Starting nuke sequence");
+        Log.d(TAG, "=== STARTING NUKE SEQUENCE ===");
 
-        // Dismiss the notification
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager != null) {
             manager.cancel(NOTIFICATION_ID);
         }
 
-        // Phase 1: Process the current screen (main consent toggles)
+        // First, dump the accessibility tree so we can debug
         handler.post(() -> {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root != null) {
+                Log.d(TAG, "=== ACCESSIBILITY TREE DUMP ===");
+                dumpNodeTree(root, 0);
+                root.recycle();
+            }
+
+            // Phase 1: Process current screen
             processCurrentScreen(() -> {
-                // Phase 2: Look for and tap a "Vendors" tab/button
+                // Phase 2: Look for Vendors tab
                 handler.postDelayed(() -> {
                     if (navigateToVendors()) {
-                        // Phase 3: Wait for vendor screen to load, then process it
+                        // Phase 3: Process vendor screen
                         handler.postDelayed(() -> {
                             processCurrentScreen(() -> {
-                                // Phase 4: Confirm and finish
                                 handler.postDelayed(() -> tapConfirmAndFinish(), 500);
                             });
                         }, 1500);
                     } else {
-                        // No vendor tab found - just confirm
                         handler.postDelayed(() -> tapConfirmAndFinish(), 500);
                     }
                 }, 500);
@@ -237,63 +236,104 @@ public class ConsentNukerService extends AccessibilityService {
     }
 
     /**
-     * Processes the currently visible screen:
-     * scrolls through all content and flips OFF any consent/legitimate interest toggles.
+     * Dumps the entire accessibility tree to logcat for debugging.
      */
-    private void processCurrentScreen(Runnable onComplete) {
-        processVisibleToggles(() -> {
-            // Try scrolling down to find more
-            scrollDownAndProcess(0, 5, onComplete);
-        });
+    private void dumpNodeTree(AccessibilityNodeInfo node, int depth) {
+        if (node == null) return;
+        StringBuilder indent = new StringBuilder();
+        for (int i = 0; i < depth; i++) indent.append("  ");
+
+        String className = node.getClassName() != null ? node.getClassName().toString() : "null";
+        String text = node.getText() != null ? node.getText().toString() : "";
+        String desc = node.getContentDescription() != null ? node.getContentDescription().toString() : "";
+        String stateDesc = "";
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            stateDesc = node.getStateDescription() != null ? node.getStateDescription().toString() : "";
+        }
+        String roleDesc = "";
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // No direct getRoleDescription, but we log what we can
+        }
+
+        Log.d(TAG, indent + "CLASS=" + className
+            + " TEXT=[" + text + "]"
+            + " DESC=[" + desc + "]"
+            + " STATE=[" + stateDesc + "]"
+            + " checkable=" + node.isCheckable()
+            + " checked=" + node.isChecked()
+            + " clickable=" + node.isClickable()
+            + " enabled=" + node.isEnabled()
+            + " focusable=" + node.isFocusable()
+        );
+
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                dumpNodeTree(child, depth + 1);
+            }
+        }
     }
 
     /**
-     * Recursively scrolls down and processes toggles found after each scroll.
+     * Strategy for finding and flipping toggles:
+     *
+     * APPROACH 1 (Native): Look for standard Switch/ToggleButton widgets
+     * APPROACH 2 (WebView): Find labels saying "Consent" or "Legitimate interest",
+     *   then find the nearest clickable sibling/cousin that appears to be a toggle
+     * APPROACH 3 (Brute force): Find ALL checkable elements, check if they're in
+     *   a consent-related context
+     * APPROACH 4 (Click by coordinates): If a label "Legitimate interest" has a
+     *   toggle-like element to its right, click it by bounds
      */
+    private void processCurrentScreen(Runnable onComplete) {
+        processVisibleToggles(() -> {
+            scrollDownAndProcess(0, 8, onComplete);
+        });
+    }
+
     private void scrollDownAndProcess(int scrollCount, int maxScrolls, Runnable onComplete) {
         if (scrollCount >= maxScrolls) {
             if (onComplete != null) onComplete.run();
             return;
         }
 
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) {
-            if (onComplete != null) onComplete.run();
-            return;
-        }
-
-        // Find a scrollable container
-        AccessibilityNodeInfo scrollable = findScrollableNode(root);
-        if (scrollable != null) {
-            boolean scrolled = scrollable.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD);
-            if (scrolled) {
-                handler.postDelayed(() -> {
-                    processVisibleToggles(() -> {
-                        scrollDownAndProcess(scrollCount + 1, maxScrolls, onComplete);
-                    });
-                }, 600);
-            } else {
-                // Can't scroll further
-                if (onComplete != null) onComplete.run();
-            }
+        boolean scrolled = tryScroll();
+        if (scrolled) {
+            handler.postDelayed(() -> {
+                processVisibleToggles(() -> {
+                    scrollDownAndProcess(scrollCount + 1, maxScrolls, onComplete);
+                });
+            }, 700);
         } else {
-            // Try gesture-based scrolling as fallback
-            performScrollGesture(() -> {
-                handler.postDelayed(() -> {
-                    processVisibleToggles(() -> {
-                        scrollDownAndProcess(scrollCount + 1, maxScrolls, onComplete);
-                    });
-                }, 600);
-            });
+            if (onComplete != null) onComplete.run();
         }
-
-        root.recycle();
     }
 
-    /**
-     * Finds and flips OFF all consent-related toggles currently visible on screen.
-     * CRITICAL: Only switches toggles OFF, never ON.
-     */
+    private boolean tryScroll() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return false;
+
+        AccessibilityNodeInfo scrollable = findScrollableNode(root);
+        if (scrollable != null) {
+            boolean result = scrollable.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD);
+            root.recycle();
+            return result;
+        }
+        root.recycle();
+
+        // Gesture-based scroll fallback
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            Path path = new Path();
+            path.moveTo(540, 1600);
+            path.lineTo(540, 600);
+            GestureDescription.Builder builder = new GestureDescription.Builder();
+            builder.addStroke(new GestureDescription.StrokeDescription(path, 0, 300));
+            dispatchGesture(builder.build(), null, handler);
+            return true;
+        }
+        return false;
+    }
+
     private void processVisibleToggles(Runnable onComplete) {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) {
@@ -301,85 +341,252 @@ public class ConsentNukerService extends AccessibilityService {
             return;
         }
 
-        List<AccessibilityNodeInfo> toggles = new ArrayList<>();
-        findAllToggles(root, toggles);
+        List<ToggleCandidate> candidates = new ArrayList<>();
 
-        int toggleIndex = 0;
-        flipTogglesSequentially(toggles, toggleIndex, () -> {
+        // APPROACH 1: Standard checkable widgets that are checked
+        findCheckableToggles(root, candidates);
+        Log.d(TAG, "Approach 1 (checkable widgets): found " + candidates.size() + " candidates");
+
+        // APPROACH 2: Label-based - find "Consent" / "Legitimate interest" labels
+        // and look for the toggle near each one
+        findLabelBasedToggles(root, candidates);
+        Log.d(TAG, "After Approach 2 (label-based): total " + candidates.size() + " candidates");
+
+        // Deduplicate by bounds
+        List<ToggleCandidate> deduped = deduplicateCandidates(candidates);
+        Log.d(TAG, "After dedup: " + deduped.size() + " unique candidates");
+
+        flipCandidatesSequentially(deduped, 0, () -> {
             root.recycle();
             if (onComplete != null) onComplete.run();
         });
     }
 
     /**
-     * Flips toggles one at a time with a small delay to allow UI to update.
+     * APPROACH 1: Find any node that is checkable AND checked,
+     * regardless of its class name. This catches WebView switches
+     * that expose checkable state.
      */
-    private void flipTogglesSequentially(List<AccessibilityNodeInfo> toggles, int index, Runnable onComplete) {
-        if (index >= toggles.size()) {
-            if (onComplete != null) onComplete.run();
-            return;
+    private void findCheckableToggles(AccessibilityNodeInfo node, List<ToggleCandidate> candidates) {
+        if (node == null) return;
+
+        // Check if this node is a toggle that's currently ON
+        if (node.isCheckable() && node.isChecked() && node.isEnabled()) {
+            String context = getAncestorText(node, 4).toLowerCase(Locale.ROOT);
+            // Only target consent-related toggles
+            if (context.contains("consent") || context.contains("legitimate interest")
+                || context.contains("vendor") || context.contains("partner")
+                || context.contains("cookie")) {
+                Log.d(TAG, "APPROACH 1 HIT: checkable+checked node in consent context");
+                candidates.add(new ToggleCandidate(node, "checkable"));
+            }
         }
 
-        AccessibilityNodeInfo toggle = toggles.get(index);
-
-        // SAFETY: Only flip if currently ON (checked). Never switch anything ON.
-        if (toggle.isChecked() && isConsentRelatedToggle(toggle)) {
-            Log.d(TAG, "Flipping toggle OFF: " + getToggleContext(toggle));
-            toggle.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-            totalTogglesFlipped++;
-
-            // Small delay to let UI update before processing next toggle
-            handler.postDelayed(() -> {
-                flipTogglesSequentially(toggles, index + 1, onComplete);
-            }, 150);
-        } else {
-            // Skip - either already off or not consent-related
-            flipTogglesSequentially(toggles, index + 1, onComplete);
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                findCheckableToggles(child, candidates);
+            }
         }
     }
 
     /**
-     * Determines if a toggle is associated with consent or legitimate interest.
-     * Searches the toggle's own text, content description, and nearby sibling/parent text.
+     * APPROACH 2: Find text labels "Consent" or "Legitimate interest",
+     * then search for a clickable/checkable sibling element that acts as the toggle.
+     * This is the key strategy for WebView-based CMPs.
      */
-    private boolean isConsentRelatedToggle(AccessibilityNodeInfo node) {
-        // Check the toggle's own text and content description
-        String selfText = getNodeTextLower(node);
-        for (String pattern : TOGGLE_TARGET_PATTERNS) {
-            if (selfText.contains(pattern)) return true;
-        }
+    private void findLabelBasedToggles(AccessibilityNodeInfo root, List<ToggleCandidate> candidates) {
+        List<AccessibilityNodeInfo> consentLabels = new ArrayList<>();
+        findLabelNodes(root, consentLabels);
 
-        // Check parent and sibling nodes for context
-        AccessibilityNodeInfo parent = node.getParent();
-        if (parent != null) {
-            String parentContext = getAllTextInSubtree(parent).toLowerCase(Locale.ROOT);
-            for (String pattern : TOGGLE_TARGET_PATTERNS) {
-                if (parentContext.contains(pattern)) {
-                    return true;
-                }
+        Log.d(TAG, "Found " + consentLabels.size() + " consent/legitimate interest labels");
+
+        for (AccessibilityNodeInfo label : consentLabels) {
+            String labelText = getNodeTextLower(label);
+            Log.d(TAG, "Processing label: [" + labelText.trim() + "]");
+
+            // Strategy A: Check siblings of the label's parent
+            AccessibilityNodeInfo toggle = findToggleNearLabel(label);
+            if (toggle != null) {
+                Log.d(TAG, "APPROACH 2A: Found toggle near label via tree traversal");
+                candidates.add(new ToggleCandidate(toggle, "label-sibling"));
+                continue;
             }
 
-            // Check grandparent for wider context
-            AccessibilityNodeInfo grandparent = parent.getParent();
-            if (grandparent != null) {
-                String gpContext = getAllTextInSubtree(grandparent).toLowerCase(Locale.ROOT);
-                for (String pattern : TOGGLE_TARGET_PATTERNS) {
-                    if (gpContext.contains(pattern)) {
-                        return true;
+            // Strategy B: Find a clickable element to the right of or below the label
+            // by comparing screen bounds
+            toggle = findToggleByPosition(root, label);
+            if (toggle != null) {
+                Log.d(TAG, "APPROACH 2B: Found toggle near label by position");
+                candidates.add(new ToggleCandidate(toggle, "label-position"));
+                continue;
+            }
+
+            // Strategy C: The label itself might be the toggle row.
+            // Some CMPs make the whole row clickable.
+            AccessibilityNodeInfo clickableParent = findClickableAncestor(label, 3);
+            if (clickableParent != null && isToggleLikeState(clickableParent)) {
+                Log.d(TAG, "APPROACH 2C: Label's clickable ancestor is toggle-like");
+                candidates.add(new ToggleCandidate(clickableParent, "label-ancestor"));
+            }
+        }
+    }
+
+    /**
+     * Finds all text nodes containing "consent" or "legitimate interest"
+     * that appear to be toggle labels (not headers or descriptions).
+     */
+    private void findLabelNodes(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> results) {
+        if (node == null) return;
+
+        String text = getNodeTextLower(node);
+
+        // Match standalone "consent" or "legitimate interest" labels
+        // Avoid matching long description text or headers
+        if (text.length() < 80) {
+            boolean isConsentLabel = text.contains("consent") && !text.contains("consent management")
+                && !text.contains("cookie consent") && !text.contains("confirm");
+            boolean isLegitLabel = text.contains("legitimate interest");
+
+            if (isConsentLabel || isLegitLabel) {
+                results.add(node);
+            }
+        }
+
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                findLabelNodes(child, results);
+            }
+        }
+    }
+
+    /**
+     * Walk up from a label to its parent, then search siblings for a toggle element.
+     */
+    private AccessibilityNodeInfo findToggleNearLabel(AccessibilityNodeInfo label) {
+        // Go up 1-3 levels and search children for toggle-like elements
+        AccessibilityNodeInfo current = label;
+        for (int level = 0; level < 4; level++) {
+            AccessibilityNodeInfo parent = current.getParent();
+            if (parent == null) break;
+
+            for (int i = 0; i < parent.getChildCount(); i++) {
+                AccessibilityNodeInfo sibling = parent.getChild(i);
+                if (sibling == null || sibling.equals(current)) continue;
+
+                // Is this sibling a toggle?
+                if (isToggleElement(sibling)) {
+                    if (isToggledOn(sibling)) {
+                        return sibling;
+                    }
+                }
+
+                // Check sibling's children too (one level deep)
+                for (int j = 0; j < sibling.getChildCount(); j++) {
+                    AccessibilityNodeInfo nephewNode = sibling.getChild(j);
+                    if (nephewNode != null && isToggleElement(nephewNode) && isToggledOn(nephewNode)) {
+                        return nephewNode;
                     }
                 }
             }
+            current = parent;
+        }
+        return null;
+    }
+
+    /**
+     * Find a toggle element positioned to the right of the label on screen.
+     */
+    private AccessibilityNodeInfo findToggleByPosition(AccessibilityNodeInfo root, AccessibilityNodeInfo label) {
+        Rect labelBounds = new Rect();
+        label.getBoundsInScreen(labelBounds);
+
+        List<AccessibilityNodeInfo> allClickables = new ArrayList<>();
+        findAllClickableNodes(root, allClickables);
+
+        AccessibilityNodeInfo bestMatch = null;
+        int bestDistance = Integer.MAX_VALUE;
+
+        for (AccessibilityNodeInfo clickable : allClickables) {
+            Rect clickBounds = new Rect();
+            clickable.getBoundsInScreen(clickBounds);
+
+            // Must be roughly on the same vertical line (within 100px)
+            int verticalDist = Math.abs(clickBounds.centerY() - labelBounds.centerY());
+            if (verticalDist > 100) continue;
+
+            // Must be to the right of the label
+            if (clickBounds.centerX() <= labelBounds.centerX()) continue;
+
+            // Prefer closer elements
+            int dist = clickBounds.centerX() - labelBounds.centerX();
+            if (dist < bestDistance) {
+                // Check if it looks like a toggle that's ON
+                if (isToggleElement(clickable) && isToggledOn(clickable)) {
+                    bestDistance = dist;
+                    bestMatch = clickable;
+                } else if (clickable.isCheckable() && clickable.isChecked()) {
+                    bestDistance = dist;
+                    bestMatch = clickable;
+                }
+            }
         }
 
-        // Also check: if we're on a screen that's been identified as a consent screen
-        // and the toggle is inside a list of vendors, it's likely consent-related.
-        // Check for vendor-related context higher up the tree.
-        AccessibilityNodeInfo ancestor = node;
-        for (int i = 0; i < 6; i++) {
-            ancestor = ancestor.getParent();
-            if (ancestor == null) break;
-            String ancestorText = getNodeTextLower(ancestor);
-            if (ancestorText.contains("vendor") || ancestorText.contains("partner")) {
+        return bestMatch;
+    }
+
+    /**
+     * Determines if a node looks like a toggle/switch element.
+     */
+    private boolean isToggleElement(AccessibilityNodeInfo node) {
+        if (node == null) return false;
+
+        String className = node.getClassName() != null ? node.getClassName().toString() : "";
+
+        // Native switches
+        if (className.contains("Switch") || className.contains("ToggleButton") ||
+            className.contains("CompoundButton")) {
+            return true;
+        }
+
+        // Checkable elements (WebView toggles often expose this)
+        if (node.isCheckable()) {
+            return true;
+        }
+
+        // Clickable View with state description (Android 11+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && node.isClickable()) {
+            CharSequence stateDesc = node.getStateDescription();
+            if (stateDesc != null) {
+                String state = stateDesc.toString().toLowerCase(Locale.ROOT);
+                if (state.contains("on") || state.contains("off") ||
+                    state.contains("checked") || state.contains("unchecked")) {
+                    return true;
+                }
+            }
+        }
+
+        // Clickable element with content description suggesting toggle
+        if (node.isClickable()) {
+            String desc = node.getContentDescription() != null ?
+                node.getContentDescription().toString().toLowerCase(Locale.ROOT) : "";
+            if (desc.contains("toggle") || desc.contains("switch") ||
+                desc.contains("on") || desc.contains("off")) {
+                return true;
+            }
+        }
+
+        // WebView: clickable View with role=switch
+        // The role may appear in the className or extras
+        if (node.isClickable() && className.equals("android.view.View")) {
+            // Generic clickable View - could be a WebView toggle
+            // Check if it has a small-ish size (toggles are usually compact)
+            Rect bounds = new Rect();
+            node.getBoundsInScreen(bounds);
+            int width = bounds.width();
+            int height = bounds.height();
+            if (width > 30 && width < 300 && height > 15 && height < 150) {
                 return true;
             }
         }
@@ -388,46 +595,132 @@ public class ConsentNukerService extends AccessibilityService {
     }
 
     /**
-     * Finds all toggle/switch elements in the node tree.
+     * Determines if a toggle-like element is currently in the ON state.
+     * CRITICAL: We only flip OFF, never ON.
      */
-    private void findAllToggles(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> toggles) {
-        if (node == null) return;
-
-        String className = node.getClassName() != null ? node.getClassName().toString() : "";
-
-        if (className.contains("Switch") ||
-            className.contains("ToggleButton") ||
-            className.contains("CompoundButton") ||
-            "android.widget.Switch".equals(className) ||
-            "androidx.appcompat.widget.SwitchCompat".equals(className)) {
-            toggles.add(node);
+    private boolean isToggledOn(AccessibilityNodeInfo node) {
+        // Standard checked state
+        if (node.isCheckable() && node.isChecked()) {
+            return true;
         }
 
-        // Also check role description for WebView-based toggles
-        if (node.isCheckable()) {
-            String role = "";
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                // No direct role access - but isCheckable covers most cases
-            }
-            if (!className.contains("CheckBox")) {
-                // Include checkable items that aren't checkboxes
-                // (checkboxes might be purpose-specific elsewhere)
-                if (!toggles.contains(node)) {
-                    toggles.add(node);
+        // State description (Android 11+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            CharSequence stateDesc = node.getStateDescription();
+            if (stateDesc != null) {
+                String state = stateDesc.toString().toLowerCase(Locale.ROOT);
+                // "ON" or "checked" means it's toggled on
+                if (state.equals("on") || state.contains("checked") || state.equals("true")) {
+                    return true;
                 }
             }
         }
 
+        // Content description
+        String desc = node.getContentDescription() != null ?
+            node.getContentDescription().toString().toLowerCase(Locale.ROOT) : "";
+        if (desc.contains("on") || desc.contains("enabled") || desc.contains("active")) {
+            // Make sure it's not "consent" containing "on" coincidentally
+            if (desc.equals("on") || desc.contains("toggle on") || desc.contains("switch on")
+                || desc.contains("turned on") || desc.endsWith(" on")) {
+                return true;
+            }
+        }
+
+        // Text content
+        String text = node.getText() != null ?
+            node.getText().toString().toLowerCase(Locale.ROOT) : "";
+        if (text.equals("on") || text.equals("true")) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Check if an ancestor-level node has toggle-like state.
+     */
+    private boolean isToggleLikeState(AccessibilityNodeInfo node) {
+        if (node.isCheckable() && node.isChecked()) return true;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            CharSequence stateDesc = node.getStateDescription();
+            if (stateDesc != null) {
+                String state = stateDesc.toString().toLowerCase(Locale.ROOT);
+                return state.equals("on") || state.contains("checked");
+            }
+        }
+        return false;
+    }
+
+    private AccessibilityNodeInfo findClickableAncestor(AccessibilityNodeInfo node, int maxLevels) {
+        AccessibilityNodeInfo current = node;
+        for (int i = 0; i < maxLevels; i++) {
+            current = current.getParent();
+            if (current == null) return null;
+            if (current.isClickable()) return current;
+        }
+        return null;
+    }
+
+    private void findAllClickableNodes(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> results) {
+        if (node == null) return;
+        if (node.isClickable() || node.isCheckable()) {
+            results.add(node);
+        }
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
             if (child != null) {
-                findAllToggles(child, toggles);
+                findAllClickableNodes(child, results);
             }
         }
     }
 
     /**
-     * Attempts to find and tap a "Vendors" navigation element.
+     * Flips toggle candidates one at a time.
+     */
+    private void flipCandidatesSequentially(List<ToggleCandidate> candidates, int index, Runnable onComplete) {
+        if (index >= candidates.size()) {
+            if (onComplete != null) onComplete.run();
+            return;
+        }
+
+        ToggleCandidate candidate = candidates.get(index);
+        AccessibilityNodeInfo node = candidate.node;
+
+        Log.d(TAG, "Flipping candidate " + index + " (found via " + candidate.source + ")");
+
+        // Try click action
+        boolean clicked = node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        if (!clicked) {
+            // Try clicking by tapping the center of the element's bounds
+            Rect bounds = new Rect();
+            node.getBoundsInScreen(bounds);
+            Log.d(TAG, "Direct click failed, trying gesture at " + bounds.centerX() + "," + bounds.centerY());
+            performTapGesture(bounds.centerX(), bounds.centerY());
+        }
+
+        totalTogglesFlipped++;
+
+        handler.postDelayed(() -> {
+            flipCandidatesSequentially(candidates, index + 1, onComplete);
+        }, 200);
+    }
+
+    /**
+     * Tap at specific screen coordinates using a gesture.
+     */
+    private void performTapGesture(int x, int y) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            Path path = new Path();
+            path.moveTo(x, y);
+            GestureDescription.Builder builder = new GestureDescription.Builder();
+            builder.addStroke(new GestureDescription.StrokeDescription(path, 0, 50));
+            dispatchGesture(builder.build(), null, handler);
+        }
+    }
+
+    /**
+     * Navigate to the Vendors tab.
      */
     private boolean navigateToVendors() {
         AccessibilityNodeInfo root = getRootInActiveWindow();
@@ -448,7 +741,7 @@ public class ConsentNukerService extends AccessibilityService {
     }
 
     /**
-     * Finds the confirm/save button and taps it, then shows the toast summary.
+     * Find and tap the confirm button, then show results toast.
      */
     private void tapConfirmAndFinish() {
         AccessibilityNodeInfo root = getRootInActiveWindow();
@@ -465,45 +758,66 @@ public class ConsentNukerService extends AccessibilityService {
             }
 
             if (!confirmed) {
-                Log.d(TAG, "No confirm button found - looking for any button with confirm-like text");
-                // Broader search - look for any clickable element
-                AccessibilityNodeInfo broadConfirm = findAnyNodeWithConfirmText(root);
-                if (broadConfirm != null) {
-                    broadConfirm.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-                    confirmed = true;
+                // Try broader search
+                List<AccessibilityNodeInfo> allClickables = new ArrayList<>();
+                findAllClickableNodes(root, allClickables);
+                for (AccessibilityNodeInfo node : allClickables) {
+                    String nodeText = getNodeTextLower(node);
+                    for (String pattern : CONFIRM_PATTERNS) {
+                        if (nodeText.contains(pattern)) {
+                            node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                            confirmed = true;
+                            break;
+                        }
+                    }
+                    if (confirmed) break;
                 }
             }
 
             root.recycle();
         }
 
-        // Show summary toast
         final int count = totalTogglesFlipped;
         handler.post(() -> {
             String message;
             if (count == 0) {
-                message = "Consent Nuker: No toggles needed flipping";
+                message = "Consent Nuker: No toggles needed flipping. Check logcat for debug info.";
             } else {
                 message = String.format(Locale.UK, "Consent Nuker: %d toggle%s switched OFF",
                     count, count == 1 ? "" : "s");
             }
             Toast.makeText(ConsentNukerService.this, message, Toast.LENGTH_LONG).show();
+            Log.d(TAG, message);
         });
 
         isNuking = false;
-        Log.d(TAG, "Nuke complete. Total toggles flipped: " + totalTogglesFlipped);
+        Log.d(TAG, "=== NUKE COMPLETE. Total flipped: " + totalTogglesFlipped + " ===");
+    }
+
+    private List<ToggleCandidate> deduplicateCandidates(List<ToggleCandidate> candidates) {
+        List<ToggleCandidate> result = new ArrayList<>();
+        List<String> seenBounds = new ArrayList<>();
+
+        for (ToggleCandidate candidate : candidates) {
+            Rect bounds = new Rect();
+            candidate.node.getBoundsInScreen(bounds);
+            String key = bounds.toShortString();
+            if (!seenBounds.contains(key)) {
+                seenBounds.add(key);
+                result.add(candidate);
+            }
+        }
+        return result;
     }
 
     // --- Utility methods ---
 
     private AccessibilityNodeInfo findNodeWithText(AccessibilityNodeInfo root, String text) {
         if (root == null) return null;
-
         String nodeText = getNodeTextLower(root);
         if (nodeText.contains(text.toLowerCase(Locale.ROOT))) {
             return root;
         }
-
         for (int i = 0; i < root.getChildCount(); i++) {
             AccessibilityNodeInfo child = root.getChild(i);
             if (child != null) {
@@ -516,44 +830,20 @@ public class ConsentNukerService extends AccessibilityService {
 
     private AccessibilityNodeInfo findClickableNodeWithText(AccessibilityNodeInfo root, String text) {
         if (root == null) return null;
-
         String nodeText = getNodeTextLower(root);
         if (nodeText.contains(text.toLowerCase(Locale.ROOT))) {
             if (root.isClickable()) return root;
-            // Walk up to find clickable parent
             AccessibilityNodeInfo parent = root.getParent();
             for (int i = 0; i < 4 && parent != null; i++) {
                 if (parent.isClickable()) return parent;
                 parent = parent.getParent();
             }
-            // If nothing clickable found, try clicking the node itself
             return root;
         }
-
         for (int i = 0; i < root.getChildCount(); i++) {
             AccessibilityNodeInfo child = root.getChild(i);
             if (child != null) {
                 AccessibilityNodeInfo result = findClickableNodeWithText(child, text);
-                if (result != null) return result;
-            }
-        }
-        return null;
-    }
-
-    private AccessibilityNodeInfo findAnyNodeWithConfirmText(AccessibilityNodeInfo root) {
-        if (root == null) return null;
-
-        String nodeText = getNodeTextLower(root);
-        for (String pattern : CONFIRM_PATTERNS) {
-            if (nodeText.contains(pattern.toLowerCase(Locale.ROOT))) {
-                return root;
-            }
-        }
-
-        for (int i = 0; i < root.getChildCount(); i++) {
-            AccessibilityNodeInfo child = root.getChild(i);
-            if (child != null) {
-                AccessibilityNodeInfo result = findAnyNodeWithConfirmText(child);
                 if (result != null) return result;
             }
         }
@@ -573,56 +863,40 @@ public class ConsentNukerService extends AccessibilityService {
         return null;
     }
 
-    private void performScrollGesture(Runnable onComplete) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            Path path = new Path();
-            // Swipe from bottom-center to top-center
-            path.moveTo(540, 1600);
-            path.lineTo(540, 800);
-            GestureDescription.Builder builder = new GestureDescription.Builder();
-            builder.addStroke(new GestureDescription.StrokeDescription(path, 0, 300));
-            dispatchGesture(builder.build(), new GestureResultCallback() {
-                @Override
-                public void onCompleted(GestureDescription gestureDescription) {
-                    if (onComplete != null) onComplete.run();
-                }
-                @Override
-                public void onCancelled(GestureDescription gestureDescription) {
-                    if (onComplete != null) onComplete.run();
-                }
-            }, handler);
-        } else {
-            if (onComplete != null) onComplete.run();
-        }
-    }
-
     private String getNodeTextLower(AccessibilityNodeInfo node) {
         StringBuilder sb = new StringBuilder();
         if (node.getText() != null) sb.append(node.getText().toString().toLowerCase(Locale.ROOT)).append(" ");
-        if (node.getContentDescription() != null) sb.append(node.getContentDescription().toString().toLowerCase(Locale.ROOT));
+        if (node.getContentDescription() != null)
+            sb.append(node.getContentDescription().toString().toLowerCase(Locale.ROOT));
         return sb.toString();
     }
 
-    private String getAllTextInSubtree(AccessibilityNodeInfo node) {
-        if (node == null) return "";
+    /**
+     * Get text from ancestors up to maxLevels above this node.
+     */
+    private String getAncestorText(AccessibilityNodeInfo node, int maxLevels) {
         StringBuilder sb = new StringBuilder();
-        if (node.getText() != null) sb.append(node.getText().toString()).append(" ");
-        if (node.getContentDescription() != null) sb.append(node.getContentDescription().toString()).append(" ");
-        for (int i = 0; i < node.getChildCount(); i++) {
-            AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) {
-                sb.append(getAllTextInSubtree(child));
-            }
+        AccessibilityNodeInfo current = node;
+        for (int i = 0; i < maxLevels; i++) {
+            current = current.getParent();
+            if (current == null) break;
+            if (current.getText() != null) sb.append(current.getText().toString()).append(" ");
+            if (current.getContentDescription() != null)
+                sb.append(current.getContentDescription().toString()).append(" ");
         }
         return sb.toString();
     }
 
-    private String getToggleContext(AccessibilityNodeInfo node) {
-        AccessibilityNodeInfo parent = node.getParent();
-        if (parent != null) {
-            return getAllTextInSubtree(parent).trim().substring(0,
-                Math.min(80, getAllTextInSubtree(parent).trim().length()));
+    /**
+     * Holds a toggle candidate with metadata about how it was found.
+     */
+    private static class ToggleCandidate {
+        final AccessibilityNodeInfo node;
+        final String source;
+
+        ToggleCandidate(AccessibilityNodeInfo node, String source) {
+            this.node = node;
+            this.source = source;
         }
-        return getNodeTextLower(node);
     }
 }

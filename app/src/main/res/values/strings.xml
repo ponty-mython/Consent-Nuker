@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Consent Nuker</string>
-    <string name="service_description">Detects cookie consent dialogs in apps and allows you to reject all tracking with a single tap. Only activates when consent screens are detected. Switches toggles OFF only, never on.</string>
+    <string name="service_description">Detects cookie consent dialogs and lets you reject all tracking with a single tap. Only switches toggles OFF, never on.</string>
 </resources>
